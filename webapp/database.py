@@ -10,6 +10,8 @@ def _migrate(conn):
     for col in ("key_steps", "innovation"):
         if col not in analyses_cols:
             conn.execute(f"ALTER TABLE analyses ADD COLUMN {col} TEXT")
+    if "analysis_type" not in analyses_cols:
+        conn.execute("ALTER TABLE analyses ADD COLUMN analysis_type TEXT DEFAULT 'normal'")
 
     papers_cols = {row[1] for row in conn.execute("PRAGMA table_info(papers)")}
     for col in ("title_zh", "abstract_zh"):
@@ -26,16 +28,16 @@ def init_db():
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS papers (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                paper_id    TEXT UNIQUE,          -- arxiv id / s2 id / pwc slug
+                paper_id    TEXT UNIQUE,
                 title       TEXT NOT NULL,
                 authors     TEXT,
                 abstract    TEXT,
                 url         TEXT,
                 pdf_url     TEXT,
-                source      TEXT,                 -- arxiv / semantic_scholar / pwc
+                source      TEXT,
                 published   TEXT,
                 fetched_at  TEXT,
-                keywords    TEXT,                 -- matched keywords, comma separated
+                keywords    TEXT,
                 is_downloaded INTEGER DEFAULT 0,
                 local_path  TEXT,
                 is_starred       INTEGER DEFAULT 0,
@@ -52,10 +54,28 @@ def init_db():
                 key_steps     TEXT,
                 innovation    TEXT,
                 ideas         TEXT,
+                analysis_type TEXT DEFAULT 'normal',
                 created_at    TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS sessions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id    INTEGER REFERENCES papers(id),
+                type        TEXT NOT NULL,
+                model       TEXT,
+                digest      TEXT,
+                file_path   TEXT,
+                created_at  TEXT,
+                ended_at    TEXT
+            );
 
+            CREATE TABLE IF NOT EXISTS session_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  INTEGER REFERENCES sessions(id),
+                role        TEXT NOT NULL,
+                content     TEXT,
+                created_at  TEXT
+            );
 
             CREATE TABLE IF NOT EXISTS fetch_logs (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,8 +87,9 @@ def init_db():
         """)
         _migrate(conn)
 
+# ── Papers ────────────────────────────────────────────────────────────────────
+
 def upsert_paper(p: dict) -> int:
-    """插入或更新论文，返回 rowid"""
     with get_conn() as conn:
         existing = conn.execute(
             "SELECT id FROM papers WHERE paper_id = ?", (p["paper_id"],)
@@ -112,14 +133,19 @@ def update_paper(paper_db_id: int, **kwargs):
         conn.execute(f"UPDATE papers SET {sets} WHERE id = ?",
                      list(kwargs.values()) + [paper_db_id])
 
+# ── Analyses ──────────────────────────────────────────────────────────────────
+
 def save_analysis(paper_db_id: int, summary: str, contributions: str,
-                  key_steps: str, innovation: str, ideas: str):
+                  key_steps: str, innovation: str, ideas: str,
+                  analysis_type: str = "normal"):
     with get_conn() as conn:
         conn.execute("DELETE FROM analyses WHERE paper_id = ?", (paper_db_id,))
         conn.execute("""
-            INSERT INTO analyses (paper_id, summary, contributions, key_steps, innovation, ideas, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (paper_db_id, summary, contributions, key_steps, innovation, ideas, datetime.now().isoformat()))
+            INSERT INTO analyses (paper_id, summary, contributions, key_steps,
+                                  innovation, ideas, analysis_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (paper_db_id, summary, contributions, key_steps, innovation, ideas,
+              analysis_type, datetime.now().isoformat()))
 
 def get_analysis(paper_db_id: int):
     with get_conn() as conn:
@@ -127,6 +153,52 @@ def get_analysis(paper_db_id: int):
             "SELECT * FROM analyses WHERE paper_id = ?", (paper_db_id,)
         ).fetchone()
     return dict(row) if row else None
+
+# ── Sessions ──────────────────────────────────────────────────────────────────
+
+def create_session(paper_id: int, session_type: str, model: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO sessions (paper_id, type, model, created_at) VALUES (?, ?, ?, ?)",
+            (paper_id, session_type, model, datetime.now().isoformat())
+        )
+        return cur.lastrowid
+
+def add_session_message(session_id: int, role: str, content: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO session_messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (session_id, role, content, datetime.now().isoformat())
+        )
+
+def get_session(session_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    return dict(row) if row else None
+
+def get_session_messages(session_id: int):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM session_messages WHERE session_id = ? ORDER BY created_at",
+            (session_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def update_session(session_id: int, **kwargs):
+    sets = ", ".join(f"{k} = ?" for k in kwargs)
+    with get_conn() as conn:
+        conn.execute(f"UPDATE sessions SET {sets} WHERE id = ?",
+                     list(kwargs.values()) + [session_id])
+
+def get_paper_sessions(paper_id: int):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sessions WHERE paper_id = ? ORDER BY created_at DESC",
+            (paper_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
 
 def log_fetch(source: str, count: int, status: str):
     with get_conn() as conn:

@@ -3,27 +3,25 @@ import database
 import config
 import downloader
 import analyzer
+import explorer
 import translator
 import scheduler
+import keyword_extractor
+import trending
 
 app = Flask(__name__)
 
-# ──────────────────────────────────────────────
-# 初始化
-# ──────────────────────────────────────────────
 database.init_db()
 scheduler.start()
 
-# ──────────────────────────────────────────────
-# 页面
-# ──────────────────────────────────────────────
+# ── Pages ──────────────────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
-# ──────────────────────────────────────────────
-# 论文 API
-# ──────────────────────────────────────────────
+# ── Papers ─────────────────────────────────────────────────────────────────────
+
 @app.route("/api/papers")
 def list_papers():
     source   = request.args.get("source")
@@ -83,28 +81,88 @@ def analyze(pid):
     result = analyzer.analyze_paper(pid, force=force)
     return jsonify(result)
 
-# ──────────────────────────────────────────────
-# 统计
-# ──────────────────────────────────────────────
+# ── Advanced Exploration ───────────────────────────────────────────────────────
+
+@app.route("/api/papers/<int:pid>/explore/start", methods=["POST"])
+def explore_start(pid):
+    result = explorer.start_exploration(pid)
+    return jsonify(result)
+
+@app.route("/api/sessions/<int:sid>/chat", methods=["POST"])
+def session_chat(sid):
+    data = request.get_json()
+    if not data or not data.get("message", "").strip():
+        return jsonify({"ok": False, "msg": "消息不能为空"}), 400
+    result = explorer.chat(sid, data["message"].strip())
+    return jsonify(result)
+
+@app.route("/api/sessions/<int:sid>/end", methods=["POST"])
+def session_end(sid):
+    result = explorer.end_exploration(sid)
+    return jsonify(result)
+
+@app.route("/api/sessions/<int:sid>")
+def get_session(sid):
+    data = explorer.get_exploration(sid)
+    if not data:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(data)
+
+@app.route("/api/papers/<int:pid>/sessions")
+def paper_sessions(pid):
+    sessions = database.get_paper_sessions(pid)
+    return jsonify({"sessions": sessions})
+
+# ── Keyword Extraction ────────────────────────────────────────────────────────
+
+@app.route("/api/papers/<int:pid>/keywords", methods=["POST"])
+def extract_keywords(pid):
+    force = request.json.get("force", False) if request.is_json else False
+    result = keyword_extractor.extract_paper_keywords(pid, force=force)
+    return jsonify(result)
+
+# ── Trending ───────────────────────────────────────────────────────────────────
+
+@app.route("/api/trending")
+def get_trending():
+    return jsonify({"keywords": trending.get_trending_list()})
+
+@app.route("/api/trending/search", methods=["POST"])
+def trending_search():
+    data = request.get_json()
+    keyword = (data or {}).get("keyword", "").strip()
+    if not keyword:
+        return jsonify({"ok": False, "msg": "keyword 不能为空"}), 400
+    return jsonify(trending.ai_search_papers(keyword))
+
+@app.route("/api/trending/detail", methods=["POST"])
+def trending_detail():
+    data = request.get_json()
+    keyword = (data or {}).get("keyword", "").strip()
+    if not keyword:
+        return jsonify({"ok": False, "msg": "keyword 不能为空"}), 400
+    return jsonify(trending.ai_keyword_detail(keyword))
+
+# ── Stats ──────────────────────────────────────────────────────────────────────
+
 @app.route("/api/stats")
 def stats():
     return jsonify(database.get_stats())
 
-# ──────────────────────────────────────────────
-# 手动触发抓取
-# ──────────────────────────────────────────────
+# ── Manual fetch ───────────────────────────────────────────────────────────────
+
 @app.route("/api/fetch", methods=["POST"])
 def manual_fetch():
     results = scheduler.run_fetch()
     return jsonify({"ok": True, "results": results})
 
-# ──────────────────────────────────────────────
-# 设置
-# ──────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
+
 @app.route("/api/config", methods=["GET"])
 def get_config():
     cfg = config.load_config()
-    cfg.pop("anthropic_api_key", None)  # 不暴露 key
+    cfg.pop("anthropic_api_key", None)
+    cfg.pop("anthropic_api_key_advanced", None)
     return jsonify(cfg)
 
 @app.route("/api/config", methods=["POST"])
@@ -115,7 +173,6 @@ def save_config():
     cfg = config.load_config()
     cfg.update(new_cfg)
     config.save_config(cfg)
-    # 如果更新了定时时间，重启调度
     if "schedule_hour" in new_cfg:
         scheduler.start(hour=new_cfg["schedule_hour"])
     return jsonify({"ok": True})
